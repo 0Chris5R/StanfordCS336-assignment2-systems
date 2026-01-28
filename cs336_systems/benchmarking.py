@@ -1,9 +1,49 @@
-from cs336_basics.model import Transformer
+from cs336_basics.model import Transformer, softmax, MultiHeadSelfAttention
 from cs336_basics.train import AdamW, Muon, get_batch, cross_entropy, gradient_clipping
 import torch
 import numpy as np
 import timeit
 import argparse
+from einops import einsum
+import math
+
+
+if torch.cuda.is_available():
+    from torch.cuda import nvtx
+    nvtx_range = nvtx.range
+else:
+    from contextlib import nullcontext
+
+    def nvtx_range(name):
+        return nullcontext()
+
+
+def annotated_scaled_dot_product_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+
+    with nvtx_range("scaled dot product attention"):
+
+        d_k = K.shape[-1]
+
+        with nvtx_range("attention scores"):
+
+            scores = einsum(
+                Q, K, "... seq_len1 d_k, ... seq_len2 d_k -> ... seq_len1 seq_len2")/math.sqrt(d_k)
+
+        if mask is not None:
+            scores = scores.masked_fill(~mask, -float('inf'))
+
+        with nvtx_range("softmax of attention scores"):
+            scores = softmax(scores)
+
+        with nvtx_range("final matmul"):
+            result = einsum(
+                scores, V, "... seq_len1 seq_len2, ... seq_len2 d_v -> ... seq_len1 d_v")
+
+        return result
+
+
+MultiHeadSelfAttention.scaled_dot_product_attention = staticmethod(
+    annotated_scaled_dot_product_attention)
 
 
 def benchmark(vocab_size, context_length, d_model, num_layers, num_heads, d_ff, device, dtype, warmup_steps, batch_size, n_steps=10, compile_on=False, use_muon=False):
@@ -68,6 +108,7 @@ def benchmark(vocab_size, context_length, d_model, num_layers, num_heads, d_ff, 
 
     times_forward = np.empty(n_steps)
     times_backward = np.empty(n_steps)
+    times_optimizer = np.empty(n_steps)
 
     inputs, targets = get_batch(
         dataset, batch_size, context_length, device)
@@ -75,13 +116,14 @@ def benchmark(vocab_size, context_length, d_model, num_layers, num_heads, d_ff, 
     for i in range(n_steps):
 
         start_forward = timeit.default_timer()
-        logits = model(inputs, True)
+
+        with nvtx_range("forward"):
+            logits = model(inputs, True)
 
         device_synchronize()
         end_forward = timeit.default_timer()
         times_forward[i] = end_forward-start_forward
 
-        start_backward = timeit.default_timer()
         loss = cross_entropy(
             logits.view(-1, logits.size(-1)),
             targets.view(-1))
@@ -89,17 +131,23 @@ def benchmark(vocab_size, context_length, d_model, num_layers, num_heads, d_ff, 
         for optimizer in optimizers:
             optimizer.zero_grad()
 
-        loss.backward()
+        start_backward = timeit.default_timer()
+        with nvtx_range("backward"):
+            loss.backward()
+        device_synchronize()
+        end_backward = timeit.default_timer()
+        times_backward[i] = end_backward-start_backward
 
         gradient_clipping(model.parameters(), 1)
 
-        for optimizer in optimizers:
-            optimizer.step()
+        start_optimizer = timeit.default_timer()
+        with nvtx_range("optimizer_step"):
+            for optimizer in optimizers:
+                optimizer.step()
 
         device_synchronize()
-
-        end_backward = timeit.default_timer()
-        times_backward[i] = end_backward-start_backward
+        end_optimizer = timeit.default_timer()
+        times_optimizer[i] = end_optimizer - start_optimizer
 
     print(
         "\n-- Benchmark results --\n"
@@ -109,7 +157,10 @@ def benchmark(vocab_size, context_length, d_model, num_layers, num_heads, d_ff, 
         f"  Std:     {np.std(times_forward):.6e} s\n\n"
         "Backward pass:\n"
         f"  Average: {np.mean(times_backward):.6e} s\n"
-        f"  Std:     {np.std(times_backward):.6e} s"
+        f"  Std:     {np.std(times_backward):.6e} s\n\n"
+        "Optimizer step:\n"
+        f"  Average: {np.mean(times_optimizer):.6e} s\n"
+        f"  Std:     {np.std(times_optimizer):.6e} s"
     )
 
 

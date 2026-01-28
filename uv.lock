@@ -174,6 +174,7 @@ version = "1.0.5"
 source = { editable = "." }
 dependencies = [
     { name = "cs336-basics" },
+    { name = "einsum" },
     { name = "humanfriendly" },
     { name = "matplotlib" },
     { name = "numpy" },
@@ -190,6 +191,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "cs336-basics", editable = "../assignment1-basics" },
+    { name = "einsum", specifier = ">=0.3.0" },
     { name = "humanfriendly" },
     { name = "matplotlib" },
     { name = "numpy" },
@@ -219,6 +221,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/e5/81/df4fbe24dff8ba3934af99044188e20a98ed441ad17a274539b74e82e126/einops-0.8.1.tar.gz", hash = "sha256:de5d960a7a761225532e0f1959e5315ebeafc0cd43394732f103ca44b9837e84", size = 54805, upload-time = "2025-02-09T03:17:00.434Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/87/62/9773de14fe6c45c23649e98b83231fffd7b9892b6cf863251dc2afa73643/einops-0.8.1-py3-none-any.whl", hash = "sha256:919387eb55330f5757c6bea9165c5ff5cfe63a642682ea788a6d472576d81737", size = 64359, upload-time = "2025-02-09T03:17:01.998Z" },
+]
+
+[[package]]
+name = "einsum"
+version = "0.3.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/1e/16/371528e03f3a661ecaba4948205fb06c257bf9054eaddea089e72d56d58a/einsum-0.3.0.tar.gz", hash = "sha256:e19db2c02ad5ea8acf2926a9eab995ec1802a9db0bb39646d71e96f7cec14e31", size = 5152, upload-time = "2022-04-22T06:15:02.653Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/bd/91/d8c6ecbe3dfd2ddecbd08e095bc4388a71958a7e1c2dab772ca3daef50da/einsum-0.3.0-py3-none-any.whl", hash = "sha256:6d2b1f7932879d630969bfb599e09f8448dcbc38a2be6cee192b8a1ae02c52dc", size = 5100, upload-time = "2022-04-22T06:15:01.457Z" },
 ]
 
 [[package]]
