@@ -6,16 +6,17 @@ import timeit
 import argparse
 from einops import einsum
 import math
-
+from contextlib import nullcontext
 
 if torch.cuda.is_available():
     from torch.cuda import nvtx
     nvtx_range = nvtx.range
-else:
-    from contextlib import nullcontext
+    torch_autograd_profiler_emit_nvtx = torch.autograd.profiler.emit_nvtx
 
+else:
     def nvtx_range(name):
         return nullcontext()
+    torch_autograd_profiler_emit_nvtx = nullcontext
 
 
 def annotated_scaled_dot_product_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
@@ -46,7 +47,7 @@ MultiHeadSelfAttention.scaled_dot_product_attention = staticmethod(
     annotated_scaled_dot_product_attention)
 
 
-def benchmark(vocab_size, context_length, d_model, num_layers, num_heads, d_ff, device, dtype, warmup_steps, batch_size, n_steps=10, compile_on=False, use_muon=False):
+def benchmark(vocab_size, context_length, d_model, num_layers, num_heads, d_ff, device, dtype, warmup_steps, batch_size, n_steps=10, compile_on=False, use_muon=False, mixed_precision_dtype=None):
 
     model = Transformer(vocab_size, context_length, d_model, num_layers,
                         num_heads, d_ff, 10000, None, device, dtype, True, True)
@@ -75,93 +76,103 @@ def benchmark(vocab_size, context_length, d_model, num_layers, num_heads, d_ff, 
                           (0.95, 0.9), eps=1e-7, cautious_weight_decay=True)
         optimizers = (optimizer,)
 
-    # random data as we only care about measuring speed and memory
-    dataset = np.random.rand(context_length * batch_size * 2)
-    inputs, targets = get_batch(dataset, batch_size, context_length, device)
+    if mixed_precision_dtype is None:
+        torch_amp_autocast = nullcontext
+    else:
+        def torch_amp_autocast(): return torch.amp.autocast(
+            "cuda", dtype=mixed_precision_dtype)
 
-    # Warmup
-    if warmup_steps > 0:
-        for _ in range(warmup_steps):
+    with torch_amp_autocast():
 
-            logits = model(inputs, True)
-            loss = cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1))
+        # random data as we only care about measuring speed and memory
+        dataset = np.random.rand(context_length * batch_size * 2)
+        inputs, targets = get_batch(
+            dataset, batch_size, context_length, device)
 
-            for optimizer in optimizers:
-                optimizer.zero_grad()
+        # Warmup
+        if warmup_steps > 0:
+            for _ in range(warmup_steps):
 
-            loss.backward()
+                logits = model(inputs, True)
+                loss = cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    targets.view(-1))
 
-            gradient_clipping(model.parameters(), 1)
+                for optimizer in optimizers:
+                    optimizer.zero_grad()
 
-            for optimizer in optimizers:
-                optimizer.step()
+                loss.backward()
 
-    def device_synchronize():
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        elif device.type == "mps":
-            torch.mps.synchronize()
+                gradient_clipping(model.parameters(), 1)
 
-    # actual benchmarking:
+                for optimizer in optimizers:
+                    optimizer.step()
 
-    times_forward = np.empty(n_steps)
-    times_backward = np.empty(n_steps)
-    times_optimizer = np.empty(n_steps)
+        def device_synchronize():
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            elif device.type == "mps":
+                torch.mps.synchronize()
 
-    inputs, targets = get_batch(
-        dataset, batch_size, context_length, device)
+        # actual benchmarking:
 
-    for i in range(n_steps):
+        times_forward = np.empty(n_steps)
+        times_backward = np.empty(n_steps)
+        times_optimizer = np.empty(n_steps)
 
-        start_forward = timeit.default_timer()
+        inputs, targets = get_batch(
+            dataset, batch_size, context_length, device)
 
-        with nvtx_range("forward"):
-            logits = model(inputs, True)
+        for i in range(n_steps):
 
-        device_synchronize()
-        end_forward = timeit.default_timer()
-        times_forward[i] = end_forward-start_forward
+            start_forward = timeit.default_timer()
 
-        loss = cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            targets.view(-1))
+            with torch_autograd_profiler_emit_nvtx():
+                with nvtx_range("forward"):
+                    logits = model(inputs, True)
 
-        for optimizer in optimizers:
-            optimizer.zero_grad()
+                device_synchronize()
+                end_forward = timeit.default_timer()
+                times_forward[i] = end_forward-start_forward
 
-        start_backward = timeit.default_timer()
-        with nvtx_range("backward"):
-            loss.backward()
-        device_synchronize()
-        end_backward = timeit.default_timer()
-        times_backward[i] = end_backward-start_backward
+                loss = cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    targets.view(-1))
 
-        gradient_clipping(model.parameters(), 1)
+                for optimizer in optimizers:
+                    optimizer.zero_grad()
 
-        start_optimizer = timeit.default_timer()
-        with nvtx_range("optimizer_step"):
-            for optimizer in optimizers:
-                optimizer.step()
+                start_backward = timeit.default_timer()
+                with nvtx_range("backward"):
+                    loss.backward()
+                device_synchronize()
+                end_backward = timeit.default_timer()
+                times_backward[i] = end_backward-start_backward
 
-        device_synchronize()
-        end_optimizer = timeit.default_timer()
-        times_optimizer[i] = end_optimizer - start_optimizer
+                gradient_clipping(model.parameters(), 1)
 
-    print(
-        "\n-- Benchmark results --\n"
-        "----------------------\n\n"
-        "Forward pass:\n"
-        f"  Average: {np.mean(times_forward):.6e} s\n"
-        f"  Std:     {np.std(times_forward):.6e} s\n\n"
-        "Backward pass:\n"
-        f"  Average: {np.mean(times_backward):.6e} s\n"
-        f"  Std:     {np.std(times_backward):.6e} s\n\n"
-        "Optimizer step:\n"
-        f"  Average: {np.mean(times_optimizer):.6e} s\n"
-        f"  Std:     {np.std(times_optimizer):.6e} s"
-    )
+                start_optimizer = timeit.default_timer()
+                with nvtx_range("optimizer_step"):
+                    for optimizer in optimizers:
+                        optimizer.step()
+
+                device_synchronize()
+                end_optimizer = timeit.default_timer()
+                times_optimizer[i] = end_optimizer - start_optimizer
+
+        print(
+            "\n-- Benchmark results --\n"
+            "----------------------\n\n"
+            "Forward pass:\n"
+            f"  Average: {np.mean(times_forward):.6e} s\n"
+            f"  Std:     {np.std(times_forward):.6e} s\n\n"
+            "Backward pass:\n"
+            f"  Average: {np.mean(times_backward):.6e} s\n"
+            f"  Std:     {np.std(times_backward):.6e} s\n\n"
+            "Optimizer step:\n"
+            f"  Average: {np.mean(times_optimizer):.6e} s\n"
+            f"  Std:     {np.std(times_optimizer):.6e} s"
+        )
 
 
 # make parameters configurable through cli arguments
@@ -180,6 +191,8 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--n-steps", type=int, default=10)
+    parser.add_argument("--mixed-precision", type=str,
+                        default=None, choices=["float16", "bfloat16", None])
 
     parser.add_argument(
         "--device",
@@ -211,8 +224,11 @@ def main():
         "float32": torch.float32,
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
+        None: None
     }
     dtype = dtype_map[args.dtype]
+
+    mixed_precision_dtype = dtype_map[args.mixed_precision]
 
     print("\nRunning benchmark with configuration:")
     for k, v in vars(args).items():
@@ -232,6 +248,7 @@ def main():
         n_steps=args.n_steps,
         compile_on=args.compile,
         use_muon=args.use_muon,
+        mixed_precision_dtype=mixed_precision_dtype
     )
 
 
