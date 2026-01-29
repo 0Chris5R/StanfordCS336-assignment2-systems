@@ -49,7 +49,7 @@ MultiHeadSelfAttention.scaled_dot_product_attention = staticmethod(
 
 def benchmark(vocab_size, context_length, d_model, num_layers, num_heads, d_ff, device, dtype, warmup_steps, batch_size, n_steps=10, compile_on=False, use_muon=False, mixed_precision_dtype=None, memory_profile=None):
 
-    if memory_profile and i == 0 and device.type == "cuda":
+    if memory_profile and device.type == "cuda":
         torch.cuda.memory._record_memory_history(max_entries=1000000)
 
     model = Transformer(vocab_size, context_length, d_model, num_layers,
@@ -140,10 +140,11 @@ def benchmark(vocab_size, context_length, d_model, num_layers, num_heads, d_ff, 
 
                 # Dump memory snapshot after first forward pass if memory_profile="forward"
                 if memory_profile == "forward" and i == 0 and device.type == "cuda":
-                    torch.cuda.memory._dump_snapshot(
-                        "memory_snapshot_forward.pickle")
+                    suffix = f"_mp{mixed_precision_dtype}" if mixed_precision_dtype else ""
+                    filename = f"memory_snapshot_forward{suffix}.pickle"
+                    torch.cuda.memory._dump_snapshot(filename)
                     torch.cuda.memory._record_memory_history(enabled=None)
-                    print("Memory snapshot saved to memory_snapshot_forward.pickle")
+                    print(f"Memory snapshot saved to {filename}")
 
                 loss = cross_entropy(
                     logits.view(-1, logits.size(-1)),
@@ -172,10 +173,11 @@ def benchmark(vocab_size, context_length, d_model, num_layers, num_heads, d_ff, 
 
                 # Dump memory snapshot after first full training step if memory_profile="training"
                 if memory_profile == "training" and i == 0 and device.type == "cuda":
-                    torch.cuda.memory._dump_snapshot(
-                        "memory_snapshot_training.pickle")
+                    suffix = f"_mp{mixed_precision_dtype}" if mixed_precision_dtype else ""
+                    filename = f"memory_snapshot_training{suffix}.pickle"
+                    torch.cuda.memory._dump_snapshot(filename)
                     torch.cuda.memory._record_memory_history(enabled=None)
-                    print("Memory snapshot saved to memory_snapshot_training.pickle")
+                    print(f"Memory snapshot saved to {filename}")
 
         print(
             "\n-- Benchmark results --\n"
