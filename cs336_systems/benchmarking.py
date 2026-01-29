@@ -132,6 +132,7 @@ def benchmark(vocab_size, context_length, d_model, num_layers, num_heads, d_ff, 
 
             with torch_autograd_profiler_emit_nvtx():
                 with nvtx_range("forward"):
+
                     logits = model(inputs, True)
 
                 device_synchronize()
