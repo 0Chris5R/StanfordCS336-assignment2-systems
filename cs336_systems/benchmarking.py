@@ -82,10 +82,6 @@ def benchmark(vocab_size, context_length, d_model, num_layers, num_heads, d_ff, 
         def torch_amp_autocast(): return torch.amp.autocast(
             "cuda", dtype=mixed_precision_dtype)
 
-    # Memory profiling setup (CUDA only)
-    if memory_profile and device.type == "cuda":
-        torch.cuda.memory._record_memory_history(max_entries=1000000)
-
     with torch_amp_autocast():
 
         # random data as we only care about measuring speed and memory
@@ -128,6 +124,10 @@ def benchmark(vocab_size, context_length, d_model, num_layers, num_heads, d_ff, 
             dataset, batch_size, context_length, device)
 
         for i in range(n_steps):
+
+            # Start memory recording only for the first step (after warmup)
+            if memory_profile and i == 0 and device.type == "cuda":
+                torch.cuda.memory._record_memory_history(max_entries=1000000)
 
             start_forward = timeit.default_timer()
 
