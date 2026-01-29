@@ -47,7 +47,7 @@ MultiHeadSelfAttention.scaled_dot_product_attention = staticmethod(
     annotated_scaled_dot_product_attention)
 
 
-def benchmark(vocab_size, context_length, d_model, num_layers, num_heads, d_ff, device, dtype, warmup_steps, batch_size, n_steps=10, compile_on=False, use_muon=False, mixed_precision_dtype=None):
+def benchmark(vocab_size, context_length, d_model, num_layers, num_heads, d_ff, device, dtype, warmup_steps, batch_size, n_steps=10, compile_on=False, use_muon=False, mixed_precision_dtype=None, memory_profile=None):
 
     model = Transformer(vocab_size, context_length, d_model, num_layers,
                         num_heads, d_ff, 10000, None, device, dtype, True, True)
@@ -81,6 +81,10 @@ def benchmark(vocab_size, context_length, d_model, num_layers, num_heads, d_ff, 
     else:
         def torch_amp_autocast(): return torch.amp.autocast(
             "cuda", dtype=mixed_precision_dtype)
+
+    # Memory profiling setup (CUDA only)
+    if memory_profile and device.type == "cuda":
+        torch.cuda.memory._record_memory_history(max_entries=1000000)
 
     with torch_amp_autocast():
 
@@ -135,6 +139,12 @@ def benchmark(vocab_size, context_length, d_model, num_layers, num_heads, d_ff, 
                 end_forward = timeit.default_timer()
                 times_forward[i] = end_forward-start_forward
 
+                # Dump memory snapshot after first forward pass if memory_profile="forward"
+                if memory_profile == "forward" and i == 0 and device.type == "cuda":
+                    torch.cuda.memory._dump_snapshot("memory_snapshot_forward.pickle")
+                    torch.cuda.memory._record_memory_history(enabled=None)
+                    print("Memory snapshot saved to memory_snapshot_forward.pickle")
+
                 loss = cross_entropy(
                     logits.view(-1, logits.size(-1)),
                     targets.view(-1))
@@ -159,6 +169,12 @@ def benchmark(vocab_size, context_length, d_model, num_layers, num_heads, d_ff, 
                 device_synchronize()
                 end_optimizer = timeit.default_timer()
                 times_optimizer[i] = end_optimizer - start_optimizer
+
+                # Dump memory snapshot after first full training step if memory_profile="training"
+                if memory_profile == "training" and i == 0 and device.type == "cuda":
+                    torch.cuda.memory._dump_snapshot("memory_snapshot_training.pickle")
+                    torch.cuda.memory._record_memory_history(enabled=None)
+                    print("Memory snapshot saved to memory_snapshot_training.pickle")
 
         print(
             "\n-- Benchmark results --\n"
@@ -211,6 +227,9 @@ def parse_args():
 
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--use-muon", action="store_true")
+    parser.add_argument("--memory-profile", type=str, default=None,
+                        choices=["forward", "training"],
+                        help="Save memory snapshot: 'forward' for forward pass only, 'training' for full step")
 
     return parser.parse_args()
 
@@ -248,7 +267,8 @@ def main():
         n_steps=args.n_steps,
         compile_on=args.compile,
         use_muon=args.use_muon,
-        mixed_precision_dtype=mixed_precision_dtype
+        mixed_precision_dtype=mixed_precision_dtype,
+        memory_profile=args.memory_profile
     )
 
 
