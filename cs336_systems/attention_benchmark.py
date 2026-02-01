@@ -8,8 +8,13 @@ import itertools
 from cs336_systems.benchmarking import annotated_scaled_dot_product_attention
 
 
-def benchmark_attention():
+def benchmark_attention(compile=False):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    attn_fn = annotated_scaled_dot_product_attention
+
+    if compile:
+        attn_fn = torch.compile(attn_fn)
 
     batch_size = 8
     d_model_values = [16, 32, 64, 128]
@@ -17,7 +22,7 @@ def benchmark_attention():
     warmup_steps = 5
     n_runs = 100
 
-    print(f"{'d_model':>8} | {'seq_len':>8} | {'Forward (ms)':>20} | {'Backward (ms)':>20} | {'Memory (MB)':>12}")
+    print(f"{'d_model':>8} | {'seq_len':>8} | {'Forward (s)':>20} | {'Backward (s)':>20} | {'Memory (MB)':>12}")
     print("-" * 85)
 
     for d_model, seq_len in itertools.product(d_model_values, seq_len_values):
@@ -34,7 +39,7 @@ def benchmark_attention():
 
             # Warmup
             for _ in range(warmup_steps):
-                out = annotated_scaled_dot_product_attention(Q, K, V)
+                out = attn_fn(Q, K, V)
                 out.sum().backward()
                 Q.grad, K.grad, V.grad = None, None, None
                 torch.cuda.synchronize()
@@ -45,7 +50,7 @@ def benchmark_attention():
             for _ in range(n_runs):
                 Q.grad, K.grad, V.grad = None, None, None
                 start = timeit.default_timer()
-                out = annotated_scaled_dot_product_attention(Q, K, V)
+                out = attn_fn(Q, K, V)
                 torch.cuda.synchronize()
                 times_forward.append(timeit.default_timer() - start)
 
@@ -68,4 +73,5 @@ def benchmark_attention():
 
 
 if __name__ == "__main__":
-    benchmark_attention()
+    benchmark_attention(compile=False)
+    benchmark_attention(compile=True)
