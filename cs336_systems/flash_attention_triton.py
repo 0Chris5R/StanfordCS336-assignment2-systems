@@ -10,14 +10,17 @@ class FlashAttention(torch.autograd.Function):
     def forward(ctx, Q, K, V, is_causal=False):
 
         D = Q.shape[-1]
+        N_QUERIES = Q.shape[-2]
         scale = 1/math.sqrt(D)
         Q_TILE_SIZE = min(64, Q.shape[-2])
+        K_TILE_SIZE = min(64, K.shape[-2])
+        NUM_Q_TILES = (N_QUERIES + Q_TILE_SIZE - 1) // Q_TILE_SIZE
         BATCH_SIZE = Q.shape[0]
 
-        O = torch.empty_like(V)
+        O = torch.empty_like(Q)
         L = torch.empty_like(Q[..., 0])
 
-        flash_fwd_kernel[Q_TILE_SIZE, BATCH_SIZE](
+        flash_fwd_kernel[(NUM_Q_TILES, BATCH_SIZE)](
             Q, K, V,
             O, L,
             *Q.stride(),
@@ -25,11 +28,11 @@ class FlashAttention(torch.autograd.Function):
             *V.stride(),
             *O.stride(),
             *L.stride(),
-            Q.shape[-2], K.shape[-2],
+            N_QUERIES, K.shape[-2],
             scale,
             D=D,
             Q_TILE_SIZE=Q_TILE_SIZE,
-            K_TILE_SIZE=Q_TILE_SIZE,
+            K_TILE_SIZE=K_TILE_SIZE,
         )
 
         ctx.save_for_backward(L, Q, K, V, O)
@@ -76,7 +79,7 @@ def flash_fwd_kernel(
         strides=(stride_kd, stride_kk),
         offsets=(0, 0),
         block_shape=(D, K_TILE_SIZE),
-        order=(1, 0),
+        order=(0, 1),
     )
 
     V_block_ptr = tl.make_block_ptr(
@@ -99,14 +102,16 @@ def flash_fwd_kernel(
 
     L_block_ptr = tl.make_block_ptr(
         L_ptr + batch_index * stride_lb,
-        shape=(N_QUERIES),
-        strides=(stride_lq),
-        offsets=(query_tile_index * Q_TILE_SIZE),
-        block_shape=(Q_TILE_SIZE),
+        shape=(N_QUERIES,),
+        strides=(stride_lq,),
+        offsets=(query_tile_index * Q_TILE_SIZE,),
+        block_shape=(Q_TILE_SIZE,),
+        order=(0,),
 
     )
 
-    Qi = tl.load(Q_block_ptr, boundary_check=(0,), padding_option="zero")
+    Qi = tl.load(Q_block_ptr, boundary_check=(
+        0,), padding_option="zero").to(tl.float16)
 
     m_i = tl.full((Q_TILE_SIZE,), float('-inf'), dtype=tl.float32)
     l_i = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
@@ -114,29 +119,33 @@ def flash_fwd_kernel(
 
     for _ in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
 
-        Kj = tl.load(K_block_ptr, boundary_check=(1,), padding_option="zero")
-        Vj = tl.load(V_block_ptr, boundary_check=(0,), padding_option="zero")
+        Kj = tl.load(K_block_ptr, boundary_check=(
+            1,), padding_option="zero").to(tl.float16)
+        Vj = tl.load(V_block_ptr, boundary_check=(
+            0,), padding_option="zero").to(tl.float16)
 
-        Sj = tl.dot(Qi, Kj) * scale
+        Sj = tl.dot(Qi, Kj).to(tl.float32) * scale
 
-        mj = tl.max(m_i, tl.max(Sj, axis=0))
+        mj = tl.maximum(m_i, tl.max(Sj, axis=1))
 
         Pj = tl.exp(Sj - mj[:, None])
 
-        l_i = tl.exp(m_i - mj) * l_i + tl.sum(Pj, axis=0)
+        l_i = tl.exp(m_i - mj) * l_i + tl.sum(Pj, axis=1)
 
-        O_i = tl.exp(m_i - mj)[:, None] * O_i + tl.dot(Pj.to(Vj.dtype), Vj)
+        O_i = tl.exp(m_i - mj)[:, None] * O_i + \
+            tl.dot(Pj.to(tl.float16), Vj).to(tl.float32)
 
         m_i = mj
 
         K_block_ptr = K_block_ptr.advance((0, K_TILE_SIZE))
         V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
 
-    O_i /= l_i
+    O_i /= l_i[:, None]
 
     l_i = m_i + tl.log(l_i)
 
-    tl.store(O_block_ptr, O_i,
+    tl.store(O_block_ptr, O_i.to(O_block_ptr.type.element_ty),
              boundary_check=(0,))
 
-    tl.store(L_block_ptr, l_i, boundary_check=(0,))
+    tl.store(L_block_ptr, l_i.to(
+        L_block_ptr.type.element_ty), boundary_check=(0,))
