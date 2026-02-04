@@ -11,11 +11,13 @@ class FlashAttention(torch.autograd.Function):
 
         D = Q.shape[-1]
         scale = 1/math.sqrt(D)
+        Q_TILE_SIZE = min(64, Q.shape[-2])
+        BATCH_SIZE = Q.shape[0]
 
         O = torch.empty_like(V)
         L = torch.empty_like(Q[..., 0])
 
-        flash_fwd_kernel(
+        flash_fwd_kernel[Q_TILE_SIZE, BATCH_SIZE](
             Q, K, V,
             O, L,
             *Q.stride(),
@@ -26,8 +28,8 @@ class FlashAttention(torch.autograd.Function):
             Q.shape[-2], K.shape[-2],
             scale,
             D=D,
-            Q_TILE_SIZE=64,
-            K_TILE_SIZE=64,
+            Q_TILE_SIZE=Q_TILE_SIZE,
+            K_TILE_SIZE=Q_TILE_SIZE,
         )
 
         ctx.save_for_backward(L, Q, K, V, O)
