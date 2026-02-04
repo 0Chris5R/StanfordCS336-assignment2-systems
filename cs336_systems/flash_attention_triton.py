@@ -33,9 +33,11 @@ class FlashAttention(torch.autograd.Function):
             D=D,
             Q_TILE_SIZE=Q_TILE_SIZE,
             K_TILE_SIZE=K_TILE_SIZE,
+            is_causal=is_causal
         )
 
         ctx.save_for_backward(L, Q, K, V, O)
+        ctx.is_causal = is_causal
 
         return O
 
@@ -58,6 +60,7 @@ def flash_fwd_kernel(
     D: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
+    is_causal: tl.constexpr,
 ):
     # Program indices
     query_tile_index = tl.program_id(0)
@@ -117,7 +120,10 @@ def flash_fwd_kernel(
     l_i = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
     O_i = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
 
-    for _ in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
+    if is_causal:
+        q_pos = tl.arange(query_tile_index, query_tile_index + Q_TILE_SIZE)
+
+    for j in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
 
         Kj = tl.load(K_block_ptr, boundary_check=(
             1,), padding_option="zero").to(tl.float16)
@@ -125,6 +131,12 @@ def flash_fwd_kernel(
             0,), padding_option="zero").to(tl.float16)
 
         Sj = tl.dot(Qi, Kj).to(tl.float32) * scale
+
+        if is_causal:
+            k_pos = tl.arange(j*K_TILE_SIZE, j*K_TILE_SIZE + K_TILE_SIZE)
+
+            mask = q_pos[:, None] >= k_pos[None, :]
+            Sj = tl.where(mask, Sj, Sj - 1e6)
 
         mj = tl.maximum(m_i, tl.max(Sj, axis=1))
 

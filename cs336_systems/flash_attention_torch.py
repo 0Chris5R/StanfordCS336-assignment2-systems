@@ -26,12 +26,23 @@ class FlashAttention(torch.autograd.Function):
             l_prev = torch.zeros((*Q.shape[:-2], tile_q))
             o_prev = torch.zeros((*V.shape[:-2], tile_q, V.shape[-1]))
 
+            if is_causal:
+                pos_q = torch.arange(idx_q, idx_q + tile_q)
+
             for j in range(num_tiles):
+
                 idx_kv = j * MAX_TILE_SIZE
                 tile_kv = min(MAX_TILE_SIZE, seq_len - idx_kv)
 
                 scores = (Q[..., idx_q:idx_q+tile_q, :] @ K[..., idx_kv:idx_kv +
                                                             tile_kv, :].transpose(-1, -2)) / math.sqrt(K.shape[-1])
+
+                if is_causal:
+                    pos_k = torch.arange(idx_kv, idx_kv + tile_kv)
+
+                    mask = pos_q[:, None] >= pos_k[None, :]
+
+                    scores = scores.masked_fill(~mask, -1e6)
 
                 m = torch.maximum(m_prev, torch.max(
                     scores, dim=-1).values)
@@ -51,6 +62,7 @@ class FlashAttention(torch.autograd.Function):
             L[..., idx_q:idx_q+tile_q] = m + torch.log(l)
 
         ctx.save_for_backward(L, Q, K, V, O)
+        ctx.is_causal = is_causal
 
         return O
 
@@ -61,6 +73,7 @@ class FlashAttention(torch.autograd.Function):
 
         MAX_TILE_SIZE = 64
         L, Q, K, V, O = ctx.saved_tensors
+        is_causal = ctx.is_causal
         seq_len = Q.shape[-2]
         num_tiles = (seq_len + MAX_TILE_SIZE - 1) // MAX_TILE_SIZE
 
@@ -75,20 +88,33 @@ class FlashAttention(torch.autograd.Function):
             dK_i = torch.zeros_like(K[..., idx_kv:idx_kv+tile_kv, :])
             dV_i = torch.zeros_like(V[..., idx_kv:idx_kv+tile_kv, :])
 
+            if is_causal:
+                pos_k = torch.arange(idx_kv, idx_kv + tile_kv)
+
             for j in range(num_tiles):
                 idx_q = j * MAX_TILE_SIZE
                 tile_q = min(MAX_TILE_SIZE, seq_len - idx_q)
 
                 S = (Q[..., idx_q:idx_q+tile_q, :] @ K[..., idx_kv:idx_kv +
                                                        tile_kv, :].transpose(-1, -2)) / math.sqrt(K.shape[-1])
+
+                if is_causal:
+                    pos_q = torch.arange(idx_q, idx_q + tile_q)
+                    mask = pos_q[:, None] >= pos_k[None, :]
+
+                    S = S.masked_fill(~mask, value=-1e-6)
+
                 P = torch.exp(S-L[..., idx_q:idx_q+tile_q, None])
-                dV_j = P.transpose(-1, -2) @ grad_out[..., idx_q:idx_q+tile_q, :]
+                dV_j = P.transpose(-1, -
+                                   2) @ grad_out[..., idx_q:idx_q+tile_q, :]
                 dP = grad_out[..., idx_q:idx_q+tile_q, :] @ V[..., idx_kv:idx_kv +
                                                               tile_kv, :].transpose(-1, -2)
                 dS = P * (dP - torch.sum(O[..., idx_q:idx_q+tile_q, :] *
-                          grad_out[..., idx_q:idx_q+tile_q, :], dim=-1)[..., None])
-                dQ_j = dS @ K[..., idx_kv:idx_kv+tile_kv, :] / math.sqrt(K.shape[-1])
-                dK_j = dS.transpose(-1, -2) @ Q[..., idx_q:idx_q+tile_q, :] / math.sqrt(K.shape[-1])
+                                         grad_out[..., idx_q:idx_q+tile_q, :], dim=-1)[..., None])
+                dQ_j = dS @ K[..., idx_kv:idx_kv+tile_kv, :] /
+                math.sqrt(K.shape[-1])
+                dK_j = dS.transpose(-1, -2) @ Q[..., idx_q:idx_q +
+                                                tile_q, :] / math.sqrt(K.shape[-1])
 
                 dQ[..., idx_q:idx_q+tile_q, :] += dQ_j
                 dV_i += dV_j
