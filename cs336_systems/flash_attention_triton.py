@@ -121,7 +121,10 @@ def flash_fwd_kernel(
     O_i = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
 
     if is_causal:
-        q_pos = tl.arange(query_tile_index, query_tile_index + Q_TILE_SIZE)
+        q_pos_global = tl.arange(0, Q_TILE_SIZE)
+        q_pos_local = query_tile_index * Q_TILE_SIZE
+        q_pos = q_pos_global + q_pos_local
+        k_pos_global = tl.arange(0, K_TILE_SIZE)
 
     for j in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
 
@@ -133,7 +136,8 @@ def flash_fwd_kernel(
         Sj = tl.dot(Qi, Kj).to(tl.float32) * scale
 
         if is_causal:
-            k_pos = tl.arange(j*K_TILE_SIZE, j*K_TILE_SIZE + K_TILE_SIZE)
+            k_pos_local = j*K_TILE_SIZE
+            k_pos = k_pos_global + k_pos_local
 
             mask = q_pos[:, None] >= k_pos[None, :]
             Sj = tl.where(mask, Sj, Sj - 1e6)
