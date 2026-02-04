@@ -98,9 +98,9 @@ def flash_fwd_kernel(
     )
 
     L_block_ptr = tl.make_block_ptr(
-        L_ptr + batch_index * stride_qb,
+        L_ptr + batch_index * stride_lb,
         shape=(N_QUERIES),
-        strides=(stride_lb, stride_lq),
+        strides=(stride_lq),
         offsets=(query_tile_index * Q_TILE_SIZE),
         block_shape=(Q_TILE_SIZE),
 
