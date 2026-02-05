@@ -340,7 +340,13 @@ def flash_bwd_kv_kernel(
         k_pos_global = tl.arange(0, K_TILE_SIZE)
         k_pos = k_pos_global + k_pos_local
         q_pos_global = tl.arange(0, Q_TILE_SIZE)
-        q_tiles_start = k_pos_local // K_TILE_SIZE
+        q_tiles_start = k_pos_local // Q_TILE_SIZE
+
+        Q_block_ptr = Q_block_ptr.advance((q_tiles_start * Q_TILE_SIZE, 0))
+        grad_out_block_ptr = grad_out_block_ptr.advance(
+            (q_tiles_start * Q_TILE_SIZE, 0))
+        O_block_ptr = O_block_ptr.advance((q_tiles_start * Q_TILE_SIZE, 0))
+        L_block_ptr = L_block_ptr.advance((q_tiles_start * Q_TILE_SIZE,))
 
     for j in range(q_tiles_start, tl.cdiv(N_QUERIES, Q_TILE_SIZE)):
 
@@ -351,10 +357,10 @@ def flash_bwd_kv_kernel(
             0,), padding_option="zero")
 
         Oj = tl.load(O_block_ptr, boundary_check=(
-            0,), padding_option="zero")
+            0,), padding_option="zero").to(tl.float16)
 
         grad_out = tl.load(grad_out_block_ptr,
-                           boundary_check=(0,), padding_option="zero")
+                           boundary_check=(0,), padding_option="zero").to(tl.float16)
 
         Sj = tl.dot(Qj, tl.trans(Ki)).to(tl.float32) * scale
 
@@ -367,24 +373,22 @@ def flash_bwd_kv_kernel(
 
         Pj = tl.exp(Sj-Lj[:, None])
 
-        dV_j = tl.dot(tl.trans(Pj), grad_out)
+        dV_j = tl.dot(tl.trans(Pj).to(tl.float16), grad_out)
 
         dP = tl.dot(grad_out, tl.trans(Vi))
 
         dS = Pj * (dP - tl.sum(Oj * grad_out, axis=-1)[:, None])
 
-        dK_j = tl.dot(tl.trans(dS), Qj) * scale
+        dK_j = tl.dot(tl.trans(dS).to(tl.float16), Qj) * scale
 
         dK_i += dK_j
 
         dV_i += dV_j
 
-        # dQ_j = tl.dot(dS, Ki) * scale for the Q kernel
-
         Q_block_ptr = Q_block_ptr.advance((Q_TILE_SIZE, 0))
-        grad_out_ptr = grad_out_block_ptr.advance((Q_TILE_SIZE, 0))
+        grad_out_block_ptr = grad_out_block_ptr.advance((Q_TILE_SIZE, 0))
         O_block_ptr = O_block_ptr.advance((Q_TILE_SIZE, 0))
-        L_block_ptr = L_block_ptr.advance((Q_TILE_SIZE, 0))
+        L_block_ptr = L_block_ptr.advance((Q_TILE_SIZE,))
 
     tl.store(dK_block_ptr, dK_i.to(
         dK_block_ptr.type.element_ty), boundary_check=(0,))
@@ -489,10 +493,10 @@ def flash_bwd_q_kernel(
         0,), padding_option="zero")
 
     Oi = tl.load(O_block_ptr, boundary_check=(
-        0,), padding_option="zero")
+        0,), padding_option="zero").to(tl.float16)
 
     grad_out = tl.load(grad_out_block_ptr,
-                       boundary_check=(0,), padding_option="zero")
+                       boundary_check=(0,), padding_option="zero").to(tl.float16)
 
     k_tiles = tl.cdiv(N_KEYS, K_TILE_SIZE)
 
@@ -527,7 +531,7 @@ def flash_bwd_q_kernel(
 
         dS = Pj * (dP - tl.sum(Oi * grad_out, axis=-1)[:, None])
 
-        dQ_j = tl.dot(dS, Kj) * scale
+        dQ_j = tl.dot(dS.to(tl.float16), Kj) * scale
 
         dQ_i += dQ_j
 
