@@ -26,10 +26,14 @@ class FlashAttention(torch.autograd.Function):
             l_prev = torch.zeros((*Q.shape[:-2], tile_q))
             o_prev = torch.zeros((*V.shape[:-2], tile_q, V.shape[-1]))
 
+            kv_tile_end = num_tiles
             if is_causal:
                 pos_q = torch.arange(idx_q, idx_q + tile_q)
+                q_min = idx_q
+                q_max = idx_q + tile_q - 1
+                kv_tile_end = (q_max + 1 + MAX_TILE_SIZE - 1) // MAX_TILE_SIZE
 
-            for j in range(num_tiles):
+            for j in range(kv_tile_end):
 
                 idx_kv = j * MAX_TILE_SIZE
                 tile_kv = min(MAX_TILE_SIZE, seq_len - idx_kv)
@@ -38,11 +42,16 @@ class FlashAttention(torch.autograd.Function):
                                                             tile_kv, :].transpose(-1, -2)) / math.sqrt(K.shape[-1])
 
                 if is_causal:
-                    pos_k = torch.arange(idx_kv, idx_kv + tile_kv)
 
-                    mask = pos_q[:, None] >= pos_k[None, :]
+                    k_max = idx_kv + tile_kv - 1
 
-                    scores = scores.masked_fill(~mask, -1e6)
+                    if not (q_min >= k_max):
+
+                        pos_k = torch.arange(idx_kv, idx_kv + tile_kv)
+
+                        mask = pos_q[:, None] >= pos_k[None, :]
+
+                        scores = scores.masked_fill(~mask, -1e6)
 
                 m = torch.maximum(m_prev, torch.max(
                     scores, dim=-1).values)
@@ -69,7 +78,7 @@ class FlashAttention(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
 
-        # written like it would make sense on GPU with KV outer and Q inner loop to have less HBM reads and writes
+        # written like it would make sense on GPU with KV outer and Q inner loop to have less HBM reads and writes - on triton we would split this into 2 kernels to avoid atomic writes
 
         MAX_TILE_SIZE = 64
         L, Q, K, V, O = ctx.saved_tensors
@@ -88,10 +97,15 @@ class FlashAttention(torch.autograd.Function):
             dK_i = torch.zeros_like(K[..., idx_kv:idx_kv+tile_kv, :])
             dV_i = torch.zeros_like(V[..., idx_kv:idx_kv+tile_kv, :])
 
+            q_tiles_start = 0
             if is_causal:
                 pos_k = torch.arange(idx_kv, idx_kv + tile_kv)
+                k_min = idx_kv
+                k_max = idx_kv + tile_kv - 1
 
-            for j in range(num_tiles):
+                q_tiles_start = k_min // MAX_TILE_SIZE
+
+            for j in range(q_tiles_start, num_tiles):
                 idx_q = j * MAX_TILE_SIZE
                 tile_q = min(MAX_TILE_SIZE, seq_len - idx_q)
 
@@ -99,10 +113,14 @@ class FlashAttention(torch.autograd.Function):
                                                        tile_kv, :].transpose(-1, -2)) / math.sqrt(K.shape[-1])
 
                 if is_causal:
-                    pos_q = torch.arange(idx_q, idx_q + tile_q)
-                    mask = pos_q[:, None] >= pos_k[None, :]
+                    q_min = idx_q
 
-                    S = S.masked_fill(~mask, value=-1e-6)
+                    if not (q_min >= k_max):
+
+                        pos_q = torch.arange(idx_q, idx_q + tile_q)
+                        mask = pos_q[:, None] >= pos_k[None, :]
+
+                        S = S.masked_fill(~mask, value=-1e6)
 
                 P = torch.exp(S-L[..., idx_q:idx_q+tile_q, None])
                 dV_j = P.transpose(-1, -
@@ -111,8 +129,9 @@ class FlashAttention(torch.autograd.Function):
                                                               tile_kv, :].transpose(-1, -2)
                 dS = P * (dP - torch.sum(O[..., idx_q:idx_q+tile_q, :] *
                                          grad_out[..., idx_q:idx_q+tile_q, :], dim=-1)[..., None])
-                dQ_j = dS @ K[..., idx_kv:idx_kv+tile_kv, :] /
-                math.sqrt(K.shape[-1])
+                dQ_j = dS @ K[..., idx_kv:idx_kv+tile_kv, :] / \
+                    math.sqrt(K.shape[-1])
+
                 dK_j = dS.transpose(-1, -2) @ Q[..., idx_q:idx_q +
                                                 tile_q, :] / math.sqrt(K.shape[-1])
 
