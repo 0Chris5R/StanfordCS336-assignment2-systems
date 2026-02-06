@@ -6,6 +6,10 @@ import triton.language as tl
 
 class FlashAttention(torch.autograd.Function):
 
+    '''
+    Triton Flash Attention 2 implementation with 2 backward kernels and explicit tile handling for causal masking. Works on 3 dimensional tensors (b, s, d) or (h, s, d). For Multi-Head Attention with batch_size > 1 input would need to be flattened and reshaped afterwards.
+    '''
+
     @staticmethod
     def forward(ctx, Q, K, V, is_causal=False):
 
