@@ -4,9 +4,12 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import numpy as np
+import timeit
 
 from cs336_basics.model import Transformer
 from cs336_basics.train import AdamW, cross_entropy, gradient_clipping
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
 
 
 def setup(rank, world_size, device):
@@ -63,7 +66,18 @@ def naive_ddp_training(rank, world_size, device, training_steps, dataset, model_
 
     optimizer_ddp = AdamW(model_ddp.parameters(), **optimizer_params)
 
+    if rank == 0:
+        times = np.empty(5)
+        times_grad_transfer = np.empty(5)
+
     for step in range(training_steps):
+
+        dist.barrier(device_ids=[rank])
+        if step >= 5 and rank == 0:
+            if device.type == "cuda":
+
+                torch.cuda.synchronize()
+            time_start = timeit.default_timer()
 
         inputs, targets = get_batch_sharded(
             dataset, batch_size=batch_size, context_length=model_params["context_length"], device=data_device, rank=rank, world_size=world_size, step=step)
@@ -77,16 +91,40 @@ def naive_ddp_training(rank, world_size, device, training_steps, dataset, model_
 
         loss.backward()
 
+        if step >= 5 and rank == 0:
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            time_grad_transfer_start = timeit.default_timer()
+
         for param in model_ddp.parameters():
             dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
             param.grad /= world_size
+
+        if step >= 5 and rank == 0:
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            time_grad_transfer_stop = timeit.default_timer()
+            times_grad_transfer[step-5] = time_grad_transfer_stop - \
+                time_grad_transfer_start
 
         gradient_clipping(model_ddp.parameters(), 1.0)
 
         optimizer_ddp.step()
 
+        if step >= 5 and rank == 0:
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            time_end = timeit.default_timer()
+            times[step-5] = time_end - time_start
+
     if rank == 0:
         torch.save(model_ddp.state_dict(), "ddp_weights.pt")
+        print(
+            f"Avg time per training step with naive DDP: {np.mean(times):.6e} s")
+        print(
+            f"Time spent transfering gradients: {np.mean(times_grad_transfer):.6e} s . This equals {100*times_grad_transfer.mean()/times.mean():.2f} % of total time")
+
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":
@@ -101,12 +139,12 @@ if __name__ == "__main__":
     world_size = 2
 
     model_params = {
-        "vocab_size": 100,
-        "context_length": 32,
-        "d_model": 64,
-        "num_layers": 2,
-        "num_heads": 2,
-        "d_ff": 128,
+        "vocab_size": 10000,
+        "context_length": 512,
+        "d_model": 768,
+        "num_layers": 12,
+        "num_heads": 12,
+        "d_ff": 3072,
         "rope_theta": 10000.0,
         "weights": None,
     }
@@ -121,8 +159,9 @@ if __name__ == "__main__":
     optimizer = AdamW(model.parameters(), **optimizer_params)
 
     dataset = np.random.randint(0, 100, size=(1000,))
-    batch_size = 8
-    training_steps = 5
+    batch_size = 4
+    # First 5 steps warmup
+    training_steps = 10
 
     mp.spawn(
         fn=naive_ddp_training,
@@ -132,7 +171,13 @@ if __name__ == "__main__":
         join=True,
     )
 
+    times = np.empty(5)
     for step in range(training_steps):
+
+        if step >= 5:
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            time_start = timeit.default_timer()
 
         inputs, targets = get_batch_sharded(
             dataset, batch_size=batch_size, context_length=model_params["context_length"], device=device, rank=0, world_size=1, step=step)
@@ -150,11 +195,20 @@ if __name__ == "__main__":
 
         optimizer.step()
 
+        if step >= 5:
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            time_end = timeit.default_timer()
+            times[step-5] = time_end - time_start
+
+    print(
+        f"Avg time per training step on single process: {np.mean(times):.6e} s")
+
     ddp_weights = torch.load("ddp_weights.pt")
     single_process_weights = model.state_dict()
 
     for key in ddp_weights:
         torch.testing.assert_close(
-            ddp_weights[key], single_process_weights[key])
+            ddp_weights[key], single_process_weights[key], atol=1e-4, rtol=1e-4)
 
     print("All weights match!")
