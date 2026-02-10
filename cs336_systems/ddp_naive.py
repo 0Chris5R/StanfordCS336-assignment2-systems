@@ -159,11 +159,11 @@ if __name__ == "__main__":
 
     model_params = {
         "vocab_size": 10000,
-        "context_length": 512,
-        "d_model": 768,
-        "num_layers": 12,
-        "num_heads": 12,
-        "d_ff": 3072,
+        "context_length": 256,
+        "d_model": 1280,
+        "num_layers": 36,
+        "num_heads": 20,
+        "d_ff": 5120,
         "rope_theta": 10000.0,
         "weights": None,
     }
