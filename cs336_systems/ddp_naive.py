@@ -1,4 +1,8 @@
 
+from torch._utils import (
+    _flatten_dense_tensors,
+    _unflatten_dense_tensors,
+)
 import os
 import torch
 import torch.distributed as dist
@@ -96,9 +100,24 @@ def naive_ddp_training(rank, world_size, device, training_steps, dataset, model_
                 torch.cuda.synchronize()
             time_grad_transfer_start = timeit.default_timer()
 
+        # Super naive transfer: 1 broadcast per parameter
+        # for param in model_ddp.parameters():
+        #     dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+        #     param.grad /= world_size
+
+        # Slightly less naive: Flatten the params to one tensor, broadcast and then unflatten
+        gradients = []
         for param in model_ddp.parameters():
-            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
-            param.grad /= world_size
+            gradients.append(param.grad)
+
+        flat_grads = _flatten_dense_tensors(gradients)
+
+        dist.all_reduce(flat_grads, op=dist.ReduceOp.SUM)
+
+        unflatted_gradients = _unflatten_dense_tensors(flat_grads, gradients)
+
+        for i, param in enumerate(model_ddp.parameters()):
+            param.grad.copy_(unflatted_gradients[i] / world_size)
 
         if step >= 5 and rank == 0:
             if device.type == "cuda":
