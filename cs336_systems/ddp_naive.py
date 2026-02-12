@@ -1,4 +1,5 @@
 
+from cs336_systems.ddp_parameter import DDPParameter, DDPBucket
 from torch._utils import (
     _flatten_dense_tensors,
     _unflatten_dense_tensors,
@@ -48,9 +49,7 @@ def get_batch_sharded(dataset: np.ndarray | str, batch_size: int, context_length
     return inputs, targets
 
 
-def ddp_training(rank, world_size, device, training_steps, dataset, model_params, optimizer_params, batch_size, state_dict, ddp_type="naive"):
-
-    from cs336_systems.ddp_parameter import DDPParameter
+def ddp_training(rank, world_size, device, training_steps, dataset, model_params, optimizer_params, batch_size, state_dict, ddp_type="naive", bucket_size=None):
 
     setup(rank, world_size, device)
     if device.type == "cuda":
@@ -63,6 +62,10 @@ def ddp_training(rank, world_size, device, training_steps, dataset, model_params
     model_ddp.load_state_dict(state_dict)
     if ddp_type == "parameter":
         model_ddp = DDPParameter(model_ddp)
+
+    if ddp_type == "bucket":
+        model_ddp = DDPBucket(model_ddp, bucket_size)
+
     optimizer_ddp = AdamW(model_ddp.parameters(), **optimizer_params)
     if rank == 0:
         times = np.empty(5)
@@ -105,7 +108,7 @@ def ddp_training(rank, world_size, device, training_steps, dataset, model_params
                 time_grad_transfer_stop = timeit.default_timer()
                 times_grad_transfer[step-5] = time_grad_transfer_stop - \
                     time_grad_transfer_start
-        if ddp_type == "parameter":
+        if ddp_type == "parameter" or ddp_type == "bucket":
             model_ddp.finish_gradient_synchronization()
         gradient_clipping(model_ddp.parameters(), 1.0)
         optimizer_ddp.step()
@@ -129,6 +132,13 @@ def ddp_training(rank, world_size, device, training_steps, dataset, model_params
                        "ddp_parameter_weights.pt")
             print(
                 f"Avg time per training step with parameter overlap DDP: {np.mean(times):.6e} s")
+
+        elif ddp_type == "bucket":
+            torch.save(model_ddp.module.state_dict(),
+                       "ddp_bucket_weights.pt")
+            print(
+                f"Avg time per training step with bucket size {bucket_size}MB overlap DDP : {np.mean(times):.6e} s")
+
     dist.destroy_process_group()
 
 
@@ -183,6 +193,19 @@ if __name__ == "__main__":
     gc.collect()
     torch.cuda.empty_cache()
 
+    for bucket_sz in [1, 10, 100, 1000]:
+
+        mp.spawn(
+            fn=ddp_training,
+            args=(world_size, device, training_steps, dataset,
+                  model_params, optimizer_params, batch_size, state_dict, "bucket", bucket_sz),
+            nprocs=world_size,
+            join=True,
+        )
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
     model = Transformer(**model_params, device=device, dtype=torch.float32)
     model.load_state_dict(state_dict)
     optimizer = AdamW(model.parameters(), **optimizer_params)
@@ -190,34 +213,36 @@ if __name__ == "__main__":
     times = np.empty(5)
     nvtx.range_push("Single_process")
     for step in range(training_steps):
-            if step >= 5:
-                if device.type == "cuda":
-                    torch.cuda.synchronize()
-                time_start = timeit.default_timer()
-            inputs, targets = get_batch_sharded(
-                dataset, batch_size=batch_size, context_length=model_params["context_length"], device=device, rank=0, world_size=1, step=step)
-            logits = model(inputs)
-            loss = cross_entropy(logits.view(-1, logits.size(-1)),
-                                 targets.view(-1))
-            optimizer.zero_grad()
-            loss.backward()
-            gradient_clipping(model.parameters(), 1.0)
-            optimizer.step()
-            if step >= 5:
-                if device.type == "cuda":
-                    torch.cuda.synchronize()
-                time_end = timeit.default_timer()
-                times[step-5] = time_end - time_start
+        if step >= 5:
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            time_start = timeit.default_timer()
+        inputs, targets = get_batch_sharded(
+            dataset, batch_size=batch_size, context_length=model_params["context_length"], device=device, rank=0, world_size=1, step=step)
+        logits = model(inputs)
+        loss = cross_entropy(logits.view(-1, logits.size(-1)),
+                             targets.view(-1))
+        optimizer.zero_grad()
+        loss.backward()
+        gradient_clipping(model.parameters(), 1.0)
+        optimizer.step()
+        if step >= 5:
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            time_end = timeit.default_timer()
+            times[step-5] = time_end - time_start
     nvtx.range_pop()
     print(
         f"Avg time per training step on single process: {np.mean(times):.6e} s")
 
-    ddp_naive_weights = torch.load("ddp_naive_weights.pt")
+    ddp_parameter_weights = torch.load("ddp_naive_weights.pt")
 
     single_process_weights = model.state_dict()
-    for key in ddp_naive_weights:
+    for key in ddp_parameter_weights:
         torch.testing.assert_close(
-            ddp_naive_weights[key], single_process_weights[key], atol=1e-4, rtol=1e-4)
+            ddp_parameter_weights[key], single_process_weights[key], atol=1e-4, rtol=1e-4)
+
+    print("Naive and single proccess weights match!")
 
     ddp_parameter_weights = torch.load("ddp_parameter_weights.pt")
 
@@ -225,4 +250,11 @@ if __name__ == "__main__":
         torch.testing.assert_close(
             ddp_parameter_weights[key], single_process_weights[key], atol=1e-4, rtol=1e-4)
 
-    print("All weights match!")
+    print("Parameter overlap and single proccess weights match!")
+
+    ddp_bucket_weights = torch.load("ddp_bucket_weights.pt")
+    for key in ddp_bucket_weights:
+        torch.testing.assert_close(
+            ddp_bucket_weights[key], single_process_weights[key], atol=1e-4, rtol=1e-4)
+
+    print("Bucket overlap and single process weights match!")
