@@ -1,9 +1,11 @@
+
 from torch._utils import (
     _flatten_dense_tensors,
     _unflatten_dense_tensors,
 )
 import os
 import torch
+import torch.cuda.nvtx as nvtx
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import numpy as np
@@ -12,8 +14,8 @@ import gc
 from cs336_basics.model import Transformer
 from cs336_basics.train import AdamW, cross_entropy, gradient_clipping
 import warnings
-from pydantic.warnings import UnsupportedFieldAttributeWarning
-warnings.filterwarnings("ignore", category=UnsupportedFieldAttributeWarning)
+warnings.filterwarnings(
+    "ignore", message=".*'repr'.*Field.*|.*'frozen'.*Field.*")
 
 
 def setup(rank, world_size, device):
@@ -65,6 +67,11 @@ def ddp_training(rank, world_size, device, training_steps, dataset, model_params
     if rank == 0:
         times = np.empty(5)
         times_grad_transfer = np.empty(5)
+
+    # NVTX range for the entire training loop - visible in Nsight
+    range_name = f"DDP_{ddp_type}_rank{rank}"
+    nvtx.range_push(range_name)
+
     for step in range(training_steps):
         dist.barrier(device_ids=[rank])
         if step >= 5 and rank == 0:
@@ -107,6 +114,9 @@ def ddp_training(rank, world_size, device, training_steps, dataset, model_params
                 torch.cuda.synchronize()
             time_end = timeit.default_timer()
             times[step-5] = time_end - time_start
+
+    nvtx.range_pop()  # End NVTX range
+
     if rank == 0:
         if ddp_type == "naive":
             torch.save(model_ddp.state_dict(), "ddp_naive_weights.pt")
@@ -178,25 +188,27 @@ if __name__ == "__main__":
     optimizer = AdamW(model.parameters(), **optimizer_params)
 
     times = np.empty(5)
+    nvtx.range_push("Single_process")
     for step in range(training_steps):
-        if step >= 5:
-            if device.type == "cuda":
-                torch.cuda.synchronize()
-            time_start = timeit.default_timer()
-        inputs, targets = get_batch_sharded(
-            dataset, batch_size=batch_size, context_length=model_params["context_length"], device=device, rank=0, world_size=1, step=step)
-        logits = model(inputs)
-        loss = cross_entropy(logits.view(-1, logits.size(-1)),
-                             targets.view(-1))
-        optimizer.zero_grad()
-        loss.backward()
-        gradient_clipping(model.parameters(), 1.0)
-        optimizer.step()
-        if step >= 5:
-            if device.type == "cuda":
-                torch.cuda.synchronize()
-            time_end = timeit.default_timer()
-            times[step-5] = time_end - time_start
+            if step >= 5:
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                time_start = timeit.default_timer()
+            inputs, targets = get_batch_sharded(
+                dataset, batch_size=batch_size, context_length=model_params["context_length"], device=device, rank=0, world_size=1, step=step)
+            logits = model(inputs)
+            loss = cross_entropy(logits.view(-1, logits.size(-1)),
+                                 targets.view(-1))
+            optimizer.zero_grad()
+            loss.backward()
+            gradient_clipping(model.parameters(), 1.0)
+            optimizer.step()
+            if step >= 5:
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                time_end = timeit.default_timer()
+                times[step-5] = time_end - time_start
+    nvtx.range_pop()
     print(
         f"Avg time per training step on single process: {np.mean(times):.6e} s")
 

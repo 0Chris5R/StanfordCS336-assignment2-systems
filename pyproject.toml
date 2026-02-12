@@ -48,6 +48,8 @@ line-length = 120
 [tool.ruff.lint.extend-per-file-ignores]
 # Also ignore `E402` in all `__init__.py` files.
 "__init__.py" = ["E402", "F401", "F403", "E501"]
+# Skip import sorting for ddp_naive.py (warnings filter must come first)
+"cs336_systems/ddp_naive.py" = ["I001", "E402"]
 
 [tool.ruff.lint]
 extend-select = ["UP"]
