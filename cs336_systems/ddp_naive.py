@@ -151,10 +151,10 @@ if __name__ == "__main__":
     model_params = {
         "vocab_size": 10000,
         "context_length": 256,
-        "d_model": 1024,
-        "num_layers": 24,
-        "num_heads": 16,
-        "d_ff": 4096,
+        "d_model": 768,
+        "num_layers": 12,
+        "num_heads": 12,
+        "d_ff": 3072,
         "rope_theta": 10000.0,
         "weights": None,
     }
@@ -163,7 +163,7 @@ if __name__ == "__main__":
         "weight_decay": 0.01,
     }
     dataset = np.random.randint(0, 100, size=(1000,))
-    batch_size = 4
+    batch_size = 16
     training_steps = 10
 
     model = Transformer(**model_params, device="cpu", dtype=torch.float32)
