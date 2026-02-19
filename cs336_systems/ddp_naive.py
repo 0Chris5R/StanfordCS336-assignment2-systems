@@ -1,5 +1,6 @@
 
 from cs336_systems.ddp_parameter import DDPParameter, DDPBucket
+from cs336_systems.shard_optimizer import ShardOptimizer
 from torch._utils import (
     _flatten_dense_tensors,
     _unflatten_dense_tensors,
@@ -49,7 +50,7 @@ def get_batch_sharded(dataset: np.ndarray | str, batch_size: int, context_length
     return inputs, targets
 
 
-def ddp_training(rank, world_size, device, training_steps, dataset, model_params, optimizer_params, batch_size, state_dict, ddp_type="naive", bucket_size=None):
+def ddp_training(rank, world_size, device, training_steps, dataset, model_params, optimizer_params, batch_size, state_dict, ddp_type="naive", bucket_size=None, optimizer_sharding=False):
 
     setup(rank, world_size, device)
     if device.type == "cuda":
@@ -66,7 +67,20 @@ def ddp_training(rank, world_size, device, training_steps, dataset, model_params
     if ddp_type == "bucket":
         model_ddp = DDPBucket(model_ddp, bucket_size)
 
-    optimizer_ddp = AdamW(model_ddp.parameters(), **optimizer_params)
+    if rank == 0:
+        print(
+            f"Memory at model initialization: {torch.cuda.memory_allocated(device) / 1024**3:.2f} GB")
+
+    if optimizer_sharding is True:
+        optimizer_ddp = ShardOptimizer(
+            AdamW, model_ddp.parameters(), **optimizer_params)
+
+        if rank == 0:
+            print("With sharded optimizer: ")
+
+    else:
+        optimizer_ddp = AdamW(model_ddp.parameters(), **optimizer_params)
+
     if rank == 0:
         times = np.empty(5)
         times_grad_transfer = np.empty(5)
@@ -111,7 +125,16 @@ def ddp_training(rank, world_size, device, training_steps, dataset, model_params
         if ddp_type == "parameter" or ddp_type == "bucket":
             model_ddp.finish_gradient_synchronization()
         gradient_clipping(model_ddp.parameters(), 1.0)
+        if step == 0 and rank == 0:
+            print(
+                f"Memory before optimizer step: {torch.cuda.memory_allocated(device) / 1024**3:.2f} GB")
+
         optimizer_ddp.step()
+
+        if step == 0 and rank == 0:
+            print(
+                f"Memory after optimizer step: {torch.cuda.memory_allocated(device) / 1024**3:.2f} GB")
+
         if step >= 5 and rank == 0:
             if device.type == "cuda":
                 torch.cuda.synchronize()
@@ -199,6 +222,18 @@ if __name__ == "__main__":
             fn=ddp_training,
             args=(world_size, device, training_steps, dataset,
                   model_params, optimizer_params, batch_size, state_dict, "bucket", bucket_sz),
+            nprocs=world_size,
+            join=True,
+        )
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    for shard_optimizer in [False, True]:
+        mp.spawn(
+            fn=ddp_training,
+            args=(world_size, device, training_steps, dataset,
+                  model_params, optimizer_params, batch_size, state_dict, "parameter", None, shard_optimizer),
             nprocs=world_size,
             join=True,
         )
