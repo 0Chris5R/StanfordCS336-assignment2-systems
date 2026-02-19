@@ -73,7 +73,7 @@ def ddp_training(rank, world_size, device, training_steps, dataset, model_params
 
     if optimizer_sharding is True:
         optimizer_ddp = ShardOptimizer(
-            AdamW, model_ddp.parameters(), **optimizer_params)
+            model_ddp.parameters(), AdamW, **optimizer_params)
 
         if rank == 0:
             print("With sharded optimizer: ")
