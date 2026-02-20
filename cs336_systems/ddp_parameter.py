@@ -9,13 +9,16 @@ from torch._utils import (
 
 class DDPParameter(torch.nn.Module):
 
-    def __init__(self, module: torch.nn.Module):
+    def __init__(self, module: torch.nn.Module, sharded=False):
 
         super().__init__()
 
         self.module = module
         self.handles = []
         self.world_size = dist.get_world_size()
+        self.rank = dist.get_rank()
+        self.sharded = sharded
+        self.param_to_owner = self._construct_param_to_owner()
         for param in module.parameters():
             dist.broadcast(param.data, src=0)
             if param.requires_grad:
@@ -31,15 +34,45 @@ class DDPParameter(torch.nn.Module):
         self.handles.clear()
         for param in self.module.parameters():
             if param.requires_grad:
-                param.grad.div_(self.world_size)
+
+                if self.sharded:
+                    owner = self.param_to_owner[param]
+                    if owner == self.rank:
+                        param.grad.div_(self.world_size)
+
+                    elif self.sharded:
+                        param.grad = None
+
+                else:
+                    param.grad.div_(self.world_size)
 
     def _hook_function(self):
         def hook(param):
-            handle = dist.all_reduce(
-                param.grad, op=dist.ReduceOp.SUM, async_op=True)
+            if self.sharded:
+                owner = self.param_to_owner[param]
+                handle = dist.reduce(param.grad, dst=owner,
+                                     op=dist.ReduceOp.SUM, async_op=True)
+            else:
+                handle = dist.all_reduce(
+                    param.grad, op=dist.ReduceOp.SUM, async_op=True)
             self.handles.append(handle)
 
         return hook
+
+    def _construct_param_to_owner(self):
+
+        if self.sharded:
+
+            param_to_owner = {}
+            for i, param in enumerate(list(self.module.parameters())):
+                rank = i % self.world_size
+                param_to_owner[param] = rank
+
+        else:
+
+            param_to_owner = None
+
+        return param_to_owner
 
 
 class DDPBucket(torch.nn.Module):

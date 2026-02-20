@@ -50,7 +50,7 @@ def get_batch_sharded(dataset: np.ndarray | str, batch_size: int, context_length
     return inputs, targets
 
 
-def ddp_training(rank, world_size, device, training_steps, dataset, model_params, optimizer_params, batch_size, state_dict, ddp_type="naive", bucket_size=None, optimizer_sharding=False):
+def ddp_training(rank, world_size, device, training_steps, dataset, model_params, optimizer_params, batch_size, state_dict, ddp_type="naive", bucket_size=None, optimizer_sharding=False, shard_gradient=False):
 
     setup(rank, world_size, device)
     if device.type == "cuda":
@@ -61,7 +61,11 @@ def ddp_training(rank, world_size, device, training_steps, dataset, model_params
     model_ddp = Transformer(**model_params, device=data_device,
                             dtype=torch.float32)
     model_ddp.load_state_dict(state_dict)
-    if ddp_type == "parameter":
+
+    if ddp_type == "parameter" and shard_gradient:
+        model_ddp = DDPParameter(model_ddp, sharded=True)
+
+    elif ddp_type == "parameter":
         model_ddp = DDPParameter(model_ddp)
 
     if ddp_type == "bucket":
@@ -194,6 +198,8 @@ if __name__ == "__main__":
     del model
     gc.collect()
 
+    # naive sharding
+
     mp.spawn(
         fn=ddp_training,
         args=(world_size, device, training_steps, dataset,
@@ -205,6 +211,8 @@ if __name__ == "__main__":
     gc.collect()
     torch.cuda.empty_cache()
 
+    # parameterwise sharding
+
     mp.spawn(
         fn=ddp_training,
         args=(world_size, device, training_steps, dataset,
@@ -215,6 +223,8 @@ if __name__ == "__main__":
 
     gc.collect()
     torch.cuda.empty_cache()
+
+    # bucketewise sharding
 
     for bucket_sz in [1, 10, 100, 1000]:
 
@@ -229,6 +239,7 @@ if __name__ == "__main__":
         gc.collect()
         torch.cuda.empty_cache()
 
+    # compare optimizer sharded vs unsharded
     for shard_optimizer in [False, True]:
         mp.spawn(
             fn=ddp_training,
@@ -240,6 +251,19 @@ if __name__ == "__main__":
 
         gc.collect()
         torch.cuda.empty_cache()
+
+    # sharded optimizer and gradients
+    mp.spawn(
+        fn=ddp_training,
+        args=(world_size, device, training_steps, dataset,
+              model_params, optimizer_params, batch_size, state_dict, "parameter", None, True,
+              True),
+        nprocs=world_size,
+        join=True,
+    )
+
+    gc.collect()
+    torch.cuda.empty_cache()
 
     model = Transformer(**model_params, device=device, dtype=torch.float32)
     model.load_state_dict(state_dict)
