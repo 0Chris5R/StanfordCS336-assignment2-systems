@@ -72,6 +72,8 @@ def ddp_training(rank, world_size, device, training_steps, dataset, model_params
         model_ddp = DDPBucket(model_ddp, bucket_size)
 
     if rank == 0:
+        if shard_gradient:
+            print("With sharded gradients")
         print(
             f"Memory at model initialization: {torch.cuda.memory_allocated(device) / 1024**3:.2f} GB")
 
@@ -128,7 +130,28 @@ def ddp_training(rank, world_size, device, training_steps, dataset, model_params
                     time_grad_transfer_start
         if ddp_type == "parameter" or ddp_type == "bucket":
             model_ddp.finish_gradient_synchronization()
-        gradient_clipping(model_ddp.parameters(), 1.0)
+
+            if shard_gradient:
+
+                local_grad_norm = 0
+                for parameter in model_ddp.parameters():
+                    if parameter.grad is None:
+                        continue
+
+                    local_grad_norm += torch.sum(parameter.grad ** 2)
+
+                dist.all_reduce(local_grad_norm, op=dist.ReduceOp.SUM)
+
+                grad_norm = torch.sqrt(local_grad_norm).item()
+
+                if grad_norm > 1.0:
+                    scale = 1.0/grad_norm
+                    for parameter in model_ddp.parameters():
+                        if parameter.grad is None:
+                            continue
+                        parameter.grad.mul_(scale)
+            else:
+                gradient_clipping(model_ddp.parameters(), 1.0)
         if step == 0 and rank == 0:
             print(
                 f"Memory before optimizer step: {torch.cuda.memory_allocated(device) / 1024**3:.2f} GB")
