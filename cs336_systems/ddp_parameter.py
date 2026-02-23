@@ -9,7 +9,7 @@ from torch._utils import (
 
 class DDPParameter(torch.nn.Module):
 
-    def __init__(self, module: torch.nn.Module, sharded=False):
+    def __init__(self, module: torch.nn.Module, sharded=False, use_muon=False):
 
         super().__init__()
 
@@ -18,6 +18,7 @@ class DDPParameter(torch.nn.Module):
         self.world_size = dist.get_world_size()
         self.rank = dist.get_rank()
         self.sharded = sharded
+        self.use_muon = use_muon
         self.param_to_owner = self._construct_param_to_owner()
         for param in module.parameters():
             dist.broadcast(param.data, src=0)
@@ -64,9 +65,27 @@ class DDPParameter(torch.nn.Module):
         if self.sharded:
 
             param_to_owner = {}
-            for i, param in enumerate(list(self.module.parameters())):
-                rank = i % self.world_size
-                param_to_owner[param] = rank
+
+            if self.use_muon:
+
+                parameters_adam = []
+                parameters_muon = []
+
+                for param in self.module.parameters():
+                    if param.ndim >= 2:
+                        parameters_muon.append(param)
+                    else:
+                        parameters_adam.append(param)
+
+                for params in [parameters_adam, parameters_muon]:
+                    for i, param in enumerate(params):
+                        rank = i % self.world_size
+                        param_to_owner[param] = rank
+
+            else:
+                for i, param in enumerate(list(self.module.parameters())):
+                    rank = i % self.world_size
+                    param_to_owner[param] = rank
 
         else:
 

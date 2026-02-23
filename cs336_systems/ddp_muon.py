@@ -64,7 +64,7 @@ def ddp_training(rank, world_size, device, training_steps, dataset, model_params
     model_ddp.load_state_dict(state_dict)
 
     if ddp_type == "parameter" and shard_gradient:
-        model_ddp = DDPParameter(model_ddp, sharded=True)
+        model_ddp = DDPParameter(model_ddp, sharded=True, use_muon=True)
 
     if rank == 0:
         print("With sharded gradients")
@@ -112,7 +112,7 @@ def ddp_training(rank, world_size, device, training_steps, dataset, model_params
         if ddp_type == "parameter":
             model_ddp.finish_gradient_synchronization()
 
-            local_grad_norm = 0
+            local_grad_norm = torch.tensor(0.0, device=data_device)
             for parameter in model_ddp.parameters():
                 if parameter.grad is None:
                     continue
@@ -227,7 +227,7 @@ if __name__ == "__main__":
         optimizer_adam.zero_grad()
         optimizer_muon.zero_grad()
         loss.backward()
-        gradient_clipping(model.parameters(), 1.0)
+        gradient_clipping(list(model.parameters()), 1.0)
         optimizer_adam.step()
         optimizer_muon.step()
         if step >= 5:
