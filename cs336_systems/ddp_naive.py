@@ -50,7 +50,7 @@ def get_batch_sharded(dataset: np.ndarray | str, batch_size: int, context_length
     return inputs, targets
 
 
-def ddp_training(rank, world_size, device, training_steps, dataset, model_params, optimizer_params, batch_size, state_dict, ddp_type="naive", bucket_size=None, optimizer_sharding=False, shard_gradient=False):
+def ddp_training(rank, world_size, device, training_steps, dataset, model_params, optimizer_params, batch_size, state_dict, ddp_type="naive", bucket_size=None, shard_optimizer=False, shard_gradient=False):
 
     setup(rank, world_size, device)
     if device.type == "cuda":
@@ -77,7 +77,7 @@ def ddp_training(rank, world_size, device, training_steps, dataset, model_params
         print(
             f"Memory at model initialization: {torch.cuda.memory_allocated(device) / 1024**3:.2f} GB")
 
-    if optimizer_sharding is True:
+    if shard_optimizer is True:
         optimizer_ddp = ShardOptimizer(
             model_ddp.parameters(), AdamW, **optimizer_params)
 
@@ -93,7 +93,8 @@ def ddp_training(rank, world_size, device, training_steps, dataset, model_params
 
     # NVTX range for the entire training loop - visible in Nsight
     range_name = f"DDP_{ddp_type}_rank{rank}"
-    nvtx.range_push(range_name)
+    if device.type == "cuda":
+        nvtx.range_push(range_name)
 
     for step in range(training_steps):
         dist.barrier(device_ids=[rank])
@@ -128,12 +129,14 @@ def ddp_training(rank, world_size, device, training_steps, dataset, model_params
                 time_grad_transfer_stop = timeit.default_timer()
                 times_grad_transfer[step-5] = time_grad_transfer_stop - \
                     time_grad_transfer_start
+            gradient_clipping(list(model_ddp.parameters()), 1.0)
+
         if ddp_type == "parameter" or ddp_type == "bucket":
             model_ddp.finish_gradient_synchronization()
 
             if shard_gradient:
 
-                local_grad_norm = 0
+                local_grad_norm = torch.tensor(0.0, device=data_device)
                 for parameter in model_ddp.parameters():
                     if parameter.grad is None:
                         continue
@@ -151,7 +154,8 @@ def ddp_training(rank, world_size, device, training_steps, dataset, model_params
                             continue
                         parameter.grad.mul_(scale)
             else:
-                gradient_clipping(model_ddp.parameters(), 1.0)
+                gradient_clipping(list(model_ddp.parameters()), 1.0)
+
         if step == 0 and rank == 0:
             print(
                 f"Memory before optimizer step: {torch.cuda.memory_allocated(device) / 1024**3:.2f} GB")
@@ -168,7 +172,8 @@ def ddp_training(rank, world_size, device, training_steps, dataset, model_params
             time_end = timeit.default_timer()
             times[step-5] = time_end - time_start
 
-    nvtx.range_pop()  # End NVTX range
+    if device.type == "cuda":
+        nvtx.range_pop()  # End NVTX range
 
     if rank == 0:
         if ddp_type == "naive":
@@ -177,6 +182,13 @@ def ddp_training(rank, world_size, device, training_steps, dataset, model_params
                 f"Avg time per training step with naive DDP: {np.mean(times):.6e} s")
             print(
                 f"Time spent transfering gradients: {np.mean(times_grad_transfer):.6e} s . This equals {100*times_grad_transfer.mean()/times.mean():.2f} % of total time")
+
+        elif shard_gradient:
+            torch.save(model_ddp.module.state_dict(), "zero2_weights.pt")
+
+        elif shard_optimizer:
+            torch.save(model_ddp.module.state_dict(), "zero1_weights.pt")
+
         elif ddp_type == "parameter":
             torch.save(model_ddp.module.state_dict(),
                        "ddp_parameter_weights.pt")
@@ -293,7 +305,8 @@ if __name__ == "__main__":
     optimizer = AdamW(model.parameters(), **optimizer_params)
 
     times = np.empty(5)
-    nvtx.range_push("Single_process")
+    if device.type == "cuda":
+        nvtx.range_push("Single_process")
     for step in range(training_steps):
         if step >= 5:
             if device.type == "cuda":
@@ -306,37 +319,77 @@ if __name__ == "__main__":
                              targets.view(-1))
         optimizer.zero_grad()
         loss.backward()
-        gradient_clipping(model.parameters(), 1.0)
+        gradient_clipping(list(model.parameters()), 1.0)
         optimizer.step()
         if step >= 5:
             if device.type == "cuda":
                 torch.cuda.synchronize()
             time_end = timeit.default_timer()
             times[step-5] = time_end - time_start
-    nvtx.range_pop()
+    if device.type == "cuda":
+        nvtx.range_pop()
     print(
         f"Avg time per training step on single process: {np.mean(times):.6e} s")
 
     ddp_parameter_weights = torch.load("ddp_naive_weights.pt")
 
     single_process_weights = model.state_dict()
-    for key in ddp_parameter_weights:
-        torch.testing.assert_close(
-            ddp_parameter_weights[key], single_process_weights[key], atol=1e-4, rtol=1e-4)
 
-    print("Naive and single proccess weights match!")
+    try:
+        for key in ddp_parameter_weights:
+            torch.testing.assert_close(
+                ddp_parameter_weights[key], single_process_weights[key], atol=1e-4, rtol=1e-4)
+
+        print("Naive and single proccess weights match!")
+
+    except AssertionError as e:
+        print(f"✗ naive weights mismatch: {e}")
 
     ddp_parameter_weights = torch.load("ddp_parameter_weights.pt")
 
-    for key in ddp_parameter_weights:
-        torch.testing.assert_close(
-            ddp_parameter_weights[key], single_process_weights[key], atol=1e-4, rtol=1e-4)
+    try:
 
-    print("Parameter overlap and single proccess weights match!")
+        for key in ddp_parameter_weights:
+            torch.testing.assert_close(
+                ddp_parameter_weights[key], single_process_weights[key], atol=1e-4, rtol=1e-4)
 
-    ddp_bucket_weights = torch.load("ddp_bucket_weights.pt")
-    for key in ddp_bucket_weights:
-        torch.testing.assert_close(
-            ddp_bucket_weights[key], single_process_weights[key], atol=1e-4, rtol=1e-4)
+        print("Parameter overlap and single proccess weights match!")
 
-    print("Bucket overlap and single process weights match!")
+    except AssertionError as e:
+        print(f"✗ Parameter overlap weights mismatch: {e}")
+
+    try:
+
+        ddp_bucket_weights = torch.load("ddp_bucket_weights.pt")
+        for key in ddp_bucket_weights:
+            torch.testing.assert_close(
+                ddp_bucket_weights[key], single_process_weights[key], atol=1e-4, rtol=1e-4)
+
+        print("Bucket overlap and single process weights match!")
+
+    except AssertionError as e:
+        print(f"✗ Buckets overlap weights mismatch: {e}")
+
+    try:
+
+        zero1_weights = torch.load("zero1_weights.pt")
+        for key in zero1_weights:
+            torch.testing.assert_close(
+                zero1_weights[key], single_process_weights[key], atol=1e-4, rtol=1e-4)
+
+        print("zero1 and single process weights match!")
+
+    except AssertionError as e:
+        print(f"✗ zero1 weights mismatch: {e}")
+
+    try:
+
+        zero2_weights = torch.load("zero2_weights.pt")
+        for key in zero2_weights:
+            torch.testing.assert_close(
+                zero2_weights[key], single_process_weights[key], atol=1e-4, rtol=1e-4)
+
+        print("zero2 and single process weights match!")
+
+    except AssertionError as e:
+        print(f"✗ zero2 weights mismatch: {e}")
